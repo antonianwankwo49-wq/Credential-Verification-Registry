@@ -7,11 +7,14 @@
 (define-constant ERR-EXPIRED (err u104))
 (define-constant ERR-REVOKED (err u105))
 (define-constant ERR-INVALID-INSTITUTION (err u106))
+(define-constant ERR-BATCH-TOO-LARGE (err u107))
+(define-constant ERR-PARTIAL-FAILURE (err u108))
 
 (define-non-fungible-token credential-nft uint)
 
 (define-data-var next-credential-id uint u1)
 (define-data-var contract-active bool true)
+(define-data-var max-batch-size uint u20)
 
 (define-map credentials
   { credential-id: uint }
@@ -54,11 +57,26 @@
   }
 )
 
+(define-map batch-operations
+  { batch-id: uint }
+  {
+    institution: principal,
+    operation-type: (string-ascii 20),
+    total-count: uint,
+    success-count: uint,
+    block-height: uint
+  }
+)
+
+(define-data-var next-batch-id uint u1)
+
 (define-read-only (get-contract-info)
   {
     owner: CONTRACT-OWNER,
     active: (var-get contract-active),
-    next-id: (var-get next-credential-id)
+    next-id: (var-get next-credential-id),
+    max-batch-size: (var-get max-batch-size),
+    next-batch-id: (var-get next-batch-id)
   }
 )
 
@@ -133,6 +151,21 @@
     ok-value (if (get valid ok-value) (+ count u1) count)
     err-value count
   )
+)
+
+(define-read-only (get-batch-operation (batch-id uint))
+  (map-get? batch-operations { batch-id: batch-id })
+)
+
+(define-read-only (batch-verify-credentials (credential-ids (list 20 uint)))
+  (ok (map verify-single-credential credential-ids))
+)
+
+(define-private (verify-single-credential (credential-id uint))
+  {
+    credential-id: credential-id,
+    verification: (verify-credential credential-id)
+  }
 )
 
 (define-public (register-institution 
@@ -325,6 +358,127 @@
     (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
     (var-set contract-active true)
     (ok true)
+  )
+)
+
+(define-public (batch-issue-credentials
+  (recipients (list 20 principal))
+  (credential-type (string-ascii 50))
+  (field-of-study (string-ascii 100))
+  (expiry-blocks (optional uint))
+  (metadata-uri (string-ascii 200))
+  (grades (list 20 (optional (string-ascii 10))))
+  )
+  (let
+    (
+      (batch-id (var-get next-batch-id))
+      (batch-size (len recipients))
+      (batch-data {
+        cred-type: credential-type,
+        field: field-of-study,
+        expiry: expiry-blocks,
+        uri: metadata-uri
+      })
+    )
+    (begin
+      (asserts! (var-get contract-active) ERR-UNAUTHORIZED)
+      (asserts! (is-institution-authorized tx-sender) ERR-UNAUTHORIZED)
+      (asserts! (<= batch-size (var-get max-batch-size)) ERR-BATCH-TOO-LARGE)
+      (asserts! (is-eq (len recipients) (len grades)) ERR-INVALID-CREDENTIAL)
+      
+      (let
+        (
+          (paired-data (map create-recipient-grade-pair recipients grades))
+          (results (map process-batch-credential paired-data))
+          (success-count (fold count-successes results u0))
+        )
+        (begin
+          (map-set batch-operations
+            { batch-id: batch-id }
+            {
+              institution: tx-sender,
+              operation-type: "issue",
+              total-count: batch-size,
+              success-count: success-count,
+              block-height: burn-block-height
+            }
+          )
+          
+          (var-set next-batch-id (+ batch-id u1))
+          
+          (if (is-eq success-count batch-size)
+            (ok { batch-id: batch-id, results: results })
+            ERR-PARTIAL-FAILURE
+          )
+        )
+      )
+    )
+  )
+)
+
+(define-private (create-recipient-grade-pair 
+  (recipient principal) 
+  (grade (optional (string-ascii 10)))
+  )
+  {
+    recipient: recipient,
+    grade: grade
+  }
+)
+
+(define-private (process-batch-credential 
+  (pair { recipient: principal, grade: (optional (string-ascii 10)) })
+  )
+  (let
+    (
+      (credential-id (var-get next-credential-id))
+      (current-block burn-block-height)
+      (recipient (get recipient pair))
+      (grade (get grade pair))
+    )
+    (match (nft-mint? credential-nft credential-id recipient)
+      success
+      (begin
+        (map-set credentials
+          { credential-id: credential-id }
+          {
+            recipient: recipient,
+            institution: tx-sender,
+            credential-type: "batch-issued",
+            field-of-study: "batch-issued",
+            issue-date: current-block,
+            expiry-date: none,
+            bitcoin-block-height: current-block,
+            metadata-uri: "batch-operation",
+            is-revoked: false,
+            grade: grade
+          }
+        )
+        
+        (update-recipient-credentials recipient credential-id)
+        (update-institution-stats tx-sender true)
+        (var-set next-credential-id (+ credential-id u1))
+        
+        { success: true, credential-id: (some credential-id) }
+      )
+      error { success: false, credential-id: none }
+    )
+  )
+)
+
+(define-private (count-successes 
+  (result { success: bool, credential-id: (optional uint) }) 
+  (count uint)
+  )
+  (if (get success result) (+ count u1) count)
+)
+
+(define-public (update-batch-size (new-size uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (asserts! (and (> new-size u0) (<= new-size u50)) ERR-INVALID-CREDENTIAL)
+    (var-set max-batch-size new-size)
+    (ok new-size)
   )
 )
 
