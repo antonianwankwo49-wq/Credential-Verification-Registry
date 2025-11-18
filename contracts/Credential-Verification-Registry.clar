@@ -28,7 +28,9 @@
     bitcoin-block-height: uint,
     metadata-uri: (string-ascii 200),
     is-revoked: bool,
-    grade: (optional (string-ascii 10))
+    grade: (optional (string-ascii 10)),
+    revocation-date: (optional uint),
+    revocation-reason: (optional (string-ascii 100))
   }
 )
 
@@ -121,6 +123,18 @@
         verification-block: current-block
       })
     )
+    ERR-NOT-FOUND
+  )
+)
+
+(define-read-only (get-revocation-info (credential-id uint))
+  (match (get-credential credential-id)
+    credential-data
+    (ok {
+      revoked: (get is-revoked credential-data),
+      revocation-date: (get revocation-date credential-data),
+      revocation-reason: (get revocation-reason credential-data)
+    })
     ERR-NOT-FOUND
   )
 )
@@ -233,7 +247,9 @@
           bitcoin-block-height: current-block,
           metadata-uri: metadata-uri,
           is-revoked: false,
-          grade: grade
+          grade: grade,
+          revocation-date: none,
+          revocation-reason: none
         }
       )
       
@@ -281,10 +297,11 @@
   )
 )
 
-(define-public (revoke-credential (credential-id uint))
+(define-public (revoke-credential (credential-id uint) (revocation-reason (optional (string-ascii 100))))
   (let
     (
       (credential-data (unwrap! (get-credential credential-id) ERR-NOT-FOUND))
+      (current-block burn-block-height)
     )
     (begin
       (asserts! (var-get contract-active) ERR-UNAUTHORIZED)
@@ -293,7 +310,7 @@
       
       (map-set credentials
         { credential-id: credential-id }
-        (merge credential-data { is-revoked: true })
+        (merge credential-data { is-revoked: true, revocation-date: (some current-block), revocation-reason: revocation-reason })
       )
       
       (update-institution-stats tx-sender false)
@@ -451,7 +468,9 @@
             bitcoin-block-height: current-block,
             metadata-uri: "batch-operation",
             is-revoked: false,
-            grade: grade
+            grade: grade,
+            revocation-date: none,
+            revocation-reason: none
           }
         )
         
