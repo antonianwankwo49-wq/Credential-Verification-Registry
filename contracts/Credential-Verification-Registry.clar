@@ -9,6 +9,9 @@
 (define-constant ERR-INVALID-INSTITUTION (err u106))
 (define-constant ERR-BATCH-TOO-LARGE (err u107))
 (define-constant ERR-PARTIAL-FAILURE (err u108))
+(define-constant ERR-ALREADY-ENDORSED (err u109))
+(define-constant ERR-NOT-ENDORSER (err u110))
+(define-constant ERR-MAX-ENDORSEMENTS (err u111))
 
 (define-non-fungible-token credential-nft uint)
 
@@ -71,6 +74,27 @@
 )
 
 (define-data-var next-batch-id uint u1)
+
+(define-map endorsers
+  { endorser: principal }
+  {
+    name: (string-ascii 100),
+    title: (string-ascii 50),
+    organization: (string-ascii 100),
+    authorized: bool,
+    registration-date: uint
+  }
+)
+
+(define-map credential-endorsements
+  { credential-id: uint }
+  { endorsement-list: (list 10 { endorser: principal, comment: (string-ascii 200), endorsed-at: uint }) }
+)
+
+(define-map endorser-activity
+  { endorser: principal }
+  { total-endorsements: uint, last-activity: uint }
+)
 
 (define-read-only (get-contract-info)
   {
@@ -169,6 +193,48 @@
 
 (define-read-only (get-batch-operation (batch-id uint))
   (map-get? batch-operations { batch-id: batch-id })
+)
+
+(define-read-only (get-endorser (endorser principal))
+  (map-get? endorsers { endorser: endorser })
+)
+
+(define-read-only (get-credential-endorsements (credential-id uint))
+  (default-to
+    { endorsement-list: (list) }
+    (map-get? credential-endorsements { credential-id: credential-id })
+  )
+)
+
+(define-read-only (get-endorser-activity (endorser principal))
+  (default-to
+    { total-endorsements: u0, last-activity: u0 }
+    (map-get? endorser-activity { endorser: endorser })
+  )
+)
+
+(define-read-only (is-endorser-authorized (endorser principal))
+  (match (get-endorser endorser)
+    endorser-data (get authorized endorser-data)
+    false
+  )
+)
+
+(define-read-only (get-endorsement-count (credential-id uint))
+  (len (get endorsement-list (get-credential-endorsements credential-id)))
+)
+
+(define-read-only (has-endorser-endorsed (credential-id uint) (endorser principal))
+  (let
+    (
+      (endorsements (get endorsement-list (get-credential-endorsements credential-id)))
+    )
+    (> (len (filter check-endorser-match endorsements)) u0)
+  )
+)
+
+(define-private (check-endorser-match (endorsement { endorser: principal, comment: (string-ascii 200), endorsed-at: uint }))
+  (is-eq (get endorser endorsement) tx-sender)
 )
 
 (define-read-only (batch-verify-credentials (credential-ids (list 20 uint)))
@@ -498,6 +564,95 @@
     (asserts! (and (> new-size u0) (<= new-size u50)) ERR-INVALID-CREDENTIAL)
     (var-set max-batch-size new-size)
     (ok new-size)
+  )
+)
+
+(define-public (register-endorser
+  (name (string-ascii 100))
+  (title (string-ascii 50))
+  (organization (string-ascii 100))
+  )
+  (begin
+    (asserts! (var-get contract-active) ERR-UNAUTHORIZED)
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+    (asserts! (is-none (get-endorser tx-sender)) ERR-ALREADY-EXISTS)
+    
+    (map-set endorsers
+      { endorser: tx-sender }
+      {
+        name: name,
+        title: title,
+        organization: organization,
+        authorized: true,
+        registration-date: burn-block-height
+      }
+    )
+    
+    (map-set endorser-activity
+      { endorser: tx-sender }
+      { total-endorsements: u0, last-activity: burn-block-height }
+    )
+    
+    (ok tx-sender)
+  )
+)
+
+(define-public (endorse-credential
+  (credential-id uint)
+  (comment (string-ascii 200))
+  )
+  (let
+    (
+      (credential-data (unwrap! (get-credential credential-id) ERR-NOT-FOUND))
+      (current-endorsements (get-credential-endorsements credential-id))
+      (endorsement-list (get endorsement-list current-endorsements))
+      (current-activity (get-endorser-activity tx-sender))
+    )
+    (begin
+      (asserts! (var-get contract-active) ERR-UNAUTHORIZED)
+      (asserts! (is-endorser-authorized tx-sender) ERR-NOT-ENDORSER)
+      (asserts! (not (get is-revoked credential-data)) ERR-REVOKED)
+      (asserts! (< (len endorsement-list) u10) ERR-MAX-ENDORSEMENTS)
+      (asserts! (not (has-endorser-endorsed credential-id tx-sender)) ERR-ALREADY-ENDORSED)
+      
+      (map-set credential-endorsements
+        { credential-id: credential-id }
+        {
+          endorsement-list: (unwrap-panic (as-max-len? 
+            (append endorsement-list { endorser: tx-sender, comment: comment, endorsed-at: burn-block-height }) 
+            u10
+          ))
+        }
+      )
+      
+      (map-set endorser-activity
+        { endorser: tx-sender }
+        {
+          total-endorsements: (+ (get total-endorsements current-activity) u1),
+          last-activity: burn-block-height
+        }
+      )
+      
+      (ok credential-id)
+    )
+  )
+)
+
+(define-public (deauthorize-endorser (endorser principal))
+  (let
+    (
+      (endorser-data (unwrap! (get-endorser endorser) ERR-NOT-FOUND))
+    )
+    (begin
+      (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-UNAUTHORIZED)
+      
+      (map-set endorsers
+        { endorser: endorser }
+        (merge endorser-data { authorized: false })
+      )
+      
+      (ok endorser)
+    )
   )
 )
 
